@@ -1,2 +1,2 @@
 # CorrTransformer
-Multilabel Classification Transformer withCorrelated Latent Feature
+Multilabel Classification Transformer with Correlated Latent Feature
