@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras as K
+from focal_loss import BinaryFocalLoss
 
 class Encoder(K.layers.Layer):
     def __init__(self, dim_seq, bias=True, constraint=None):
@@ -10,7 +11,7 @@ class Encoder(K.layers.Layer):
                                         activation='relu',
                                         use_bias=bias,
                                         kernel_constraint=constraint,
-                                        kernel_regularizer=K.regularizers.L2(0.01)) for i in range(self.n_layer)]
+                                        kernel_regularizer=K.regularizers.l2(0.01)) for i in range(self.n_layer)]
     
     def call(self, x):
         for i in range(self.n_layer):
@@ -25,7 +26,8 @@ class Decoder(K.layers.Layer):
                                      activation='relu',
                                      use_bias=bias,
                                      kernel_constraint=constraint,
-                                     kernel_regularizer=K.regularizers.L2(0.01)) for i in range(self.n_layer)]
+                                     kernel_regularizer=K.regularizers.l2(0.01)) for i in range(self.n_layer - 1)]
+        self.dense = self.dense + [K.layers.Dense(dim_seq[-1], activation='sigmoid', use_bias=bias, kernel_regularizer=K.regularizers.l2(0.01))]
     def call(self, x):
         for i in range(self.n_layer):
             x = self.dense[i](x)
@@ -71,13 +73,13 @@ class MultiHeadAttention(K.layers.Layer):
         k = self.wk(y)  # (batch_size, seq_len, d_model)
         v = self.wv(y)  # (batch_size, seq_len, d_model)
     
-        q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
-        k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
-        v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
+        batch_q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
+        batch_k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
+        batch_v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
     
         # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
         # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
-        scaled_attention, attention_weights = scaled_dot_product_attention(q, k, v)
+        scaled_attention, attention_weights = scaled_dot_product_attention(batch_q, batch_k, batch_v)
     
         scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
 
@@ -105,6 +107,7 @@ class MAB(K.layers.Layer):
         MAB = self.layernorm2(H + self.rff(H))
         
         return MAB
+
 class SAB(K.layers.Layer):
     def __init__(self, d_model, num_heads):
         super(SAB, self).__init__()
@@ -112,6 +115,7 @@ class SAB(K.layers.Layer):
         
     def call(self, x):
         return self.mab(x, x)
+
 class ISAB(K.layers.Layer):
     def __init__(self, m, d_model, num_heads):
         super(ISAB, self).__init__()
@@ -124,20 +128,10 @@ class ISAB(K.layers.Layer):
         self.mab2 = MAB(d_model, num_heads)
 
     def call(self, x):
-        H = self.mab1(self.I, x)
+        H = self.mab1(tf.repeat(self.I, x.shape[0], axis=0), x)
         ISAB = self.mab2(x, H)
         
         return ISAB
-
-class PMA(K.layers.Layer):
-    def __init__(self, d_model, num_heads, k=1):
-        super(PMA, self).__init__()
-        self.S = tf.Variable(tf.keras.initializers.GlorotNormal()(shape=(1, k, d_model)))
-        self.mab = MAB(d_model, num_heads)
-        self.rff = K.layers.Dense(d_model)
-        
-    def forward(self, x):
-        return self.mab(self.S, self.rff(x))
 
 class Encoder_ISAB(K.layers.Layer):
     def __init__(self, m, d_model, num_heads):
@@ -147,47 +141,46 @@ class Encoder_ISAB(K.layers.Layer):
         
     def call(self, x):
         return self.isab2(self.isab1(x))
-class Decoder(K.layers.Layer):
-    def __init__(self, m, d_model, num_heads, k=1):
-        super(Decoder, self).__init__()
-        self.pma = PMA(d_model, num_heads, k=k)
+
+class DecoderPMA(K.layers.Layer):
+    def __init__(self, d_model, num_heads, k=1):
+        super(DecoderPMA, self).__init__()
+        self.S = tf.Variable(tf.keras.initializers.GlorotNormal()(shape=(1, k, d_model)))
+        self.mab = MAB(d_model, num_heads)
+        self.rff1 = K.layers.Dense(d_model)
         self.sab = SAB(d_model, num_heads)
-        self.rff = K.layers.Dense(d_model)
+        self.rff2 = K.layers.Dense(d_model)
         
     def call(self, x):
-        return self.rff(self.sab(self.pma(x)))
+        pma = self.mab(tf.repeat(self.S, x.shape[0], axis=0), self.rff1(x))
+        return self.rff2(self.sab(pma))
     
 class SetTransformer(K.layers.Layer):
     def __init__(self, m, d_model, num_heads, k=1):
         super(SetTransformer, self).__init__()
         self.encoder = Encoder_ISAB(m, d_model, num_heads)
-        self.decoder = Decoder(m, d_model, num_heads, k=k)
+        self.decoder_pma = DecoderPMA(d_model, num_heads)
     
     def call(self, x):
-        return self.decoder(self.encoder(x))
+        return self.decoder_pma(self.encoder(x))
     
 class NegCorr(K.losses.Loss):
     def __init__(self, lam):
         super(NegCorr, self).__init__()
         self.lam = lam
-        
-    def call(self, hx, hy):
-        hx_mean = tf.math.reduce_mean(hx, axis=-1)
-        hy_mean = tf.math.reduce_mean(hy, axis=-1)
-        resid_hx = hx - hx_mean
-        resid_hy = hy - hy_mean
-        cov = tf.math.reduce_sum(tf.linalg.matmul(resid_hx, resid_hy))
-        hx_std = tf.math.sqrt(tf.math.reduce_sum(tf.linalg.matmul(resid_hx, resid_hx)))
-        hy_std = tf.math.sqrt(tf.math.reduce_sum(tf.linalg.matmul(resid_hy, resid_hy)))
     
-        neg_corr = (-1) * self.lam * cov / (hx_std * hy_std)
+    def call(self, hx, hy):
+        hx_mean = tf.math.reduce_mean(hx, axis=0)
+        hy_mean = tf.math.reduce_mean(tf.squeeze(hy), axis=0)
+        resid_hx = hx - hx_mean
+        resid_hy = tf.squeeze(hy) - hy_mean
+        hx_reshape = tf.reshape(resid_hx, (resid_hx.shape[0], 1, resid_hx.shape[1]))
+        hy_reshape = tf.reshape(resid_hy, (resid_hy.shape[0], 1, resid_hy.shape[1]))
+        cov = tf.math.reduce_sum(tf.linalg.matmul(hx_reshape, hy_reshape, transpose_b=True))
+
+        hx_std = tf.math.sqrt(tf.math.reduce_sum(tf.linalg.matmul(hx_reshape, hx_reshape, transpose_b=True)))
+        hy_std = tf.math.sqrt(tf.math.reduce_sum(tf.linalg.matmul(hy_reshape, hy_reshape, transpose_b=True)))
+
+        neg_corr = (-1) * 2* cov / (hx_std * hy_std)
         
         return neg_corr
-
-class CrossRecon(K.losses.Loss):
-    def __init__(self):
-        super(CrossRecon, self).__init__()
-        
-    def call(self, gx, y):
-        cross_recon = K.losses.binary_crossentropy(gx, y) 
-        return cross_recon
